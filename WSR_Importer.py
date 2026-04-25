@@ -32,19 +32,26 @@ DEFAULT_METADATA_COLUMNS = {
     "Production Note",
     "Latest Version Name",
     "Shared",
+    "Report Date",
+    "WSR Report Date",
+    "WSR",
+    "WSR Report Name",
 }
 
 PREFERRED_TASK_COLUMN_ORDER = [
     "Turnover Date",
     "Version Zero Delivery Date",
+    "Layout",
     "Anim Block",
     "Anim Primary",
+    "Anim Secondary",
     "Anim Final",
     "WIP Anim",
     "WIP Asset",
     "WIP CFX",
     "WIP Comp",
     "Comp Creative Final",
+    "Creative Approval",
     "Final Asset",
     "Tech Final",
     "Next Submission Date",
@@ -81,12 +88,13 @@ def build_profile_state(
     workbook_sheets: Dict[str, pd.DataFrame],
 ) -> Dict[str, object]:
     profile_state = {
-        "include_blank_dates": bool(st.session_state.get("include_blank_dates", True)),
+        "include_tasks_even_when_pipeline_date_is_blank": bool(st.session_state.get("include_blank_dates", True)),
         "included_sheets": [
             sheet for sheet in st.session_state.get("included_sheets", []) if sheet in usable_sheet_names
         ],
         "pipeline_steps": {},
         "task_columns": {},
+        "pipeline_status_columns": {},
         "output_optional_columns": list(st.session_state.get("selected_optional_columns", [])),
     }
 
@@ -101,6 +109,9 @@ def build_profile_state(
         profile_state["task_columns"][sheet_name] = list(
             st.session_state.get(f"task_columns_{sheet_name}", [])
         )
+        profile_state["pipeline_status_columns"][sheet_name] = list(
+            st.session_state.get(f"pipeline_status_columns_{sheet_name}", [])
+        )
 
     return profile_state
 
@@ -110,26 +121,79 @@ def apply_profile_state(
     usable_sheet_names: List[str],
     workbook_sheets: Dict[str, pd.DataFrame],
 ) -> None:
-    st.session_state["include_blank_dates"] = bool(profile_state.get("include_blank_dates", True))
-    st.session_state["included_sheets"] = [
-        sheet for sheet in profile_state.get("included_sheets", []) if sheet in usable_sheet_names
-    ]
+    st.session_state["include_blank_dates"] = bool(
+        profile_state.get(
+            "include_tasks_even_when_pipeline_date_is_blank",
+            profile_state.get("include_blank_dates", True),
+        )
+    )
+    included_profile_sheets = profile_state.get("included_sheets", [])
+    matched_included_sheets = []
+    for sheet_name in usable_sheet_names:
+        entity_type, _ = detect_entity_info(workbook_sheets[sheet_name], sheet_name)
+        profile_sheet_key = find_profile_sheet_key(
+            sheet_name,
+            entity_type,
+            usable_sheet_names,
+            workbook_sheets,
+            {profile_sheet_name: True for profile_sheet_name in included_profile_sheets},
+        )
+        if profile_sheet_key is not None:
+            matched_included_sheets.append(sheet_name)
+
+    if matched_included_sheets:
+        st.session_state["included_sheets"] = matched_included_sheets
+    elif len(usable_sheet_names) == 1:
+        st.session_state["included_sheets"] = list(usable_sheet_names)
+    else:
+        st.session_state["included_sheets"] = [
+            sheet for sheet in profile_state.get("included_sheets", []) if sheet in usable_sheet_names
+        ]
     st.session_state["selected_optional_columns"] = list(
         profile_state.get("output_optional_columns", [])
     )
 
     pipeline_steps = profile_state.get("pipeline_steps", {})
     task_columns = profile_state.get("task_columns", {})
+    pipeline_status_columns = profile_state.get("pipeline_status_columns", {})
 
     for sheet_name in usable_sheet_names:
         entity_type, _ = detect_entity_info(workbook_sheets[sheet_name], sheet_name)
+        pipeline_step_profile_key = find_profile_sheet_key(
+            sheet_name,
+            entity_type,
+            usable_sheet_names,
+            workbook_sheets,
+            pipeline_steps,
+        )
+        task_columns_profile_key = find_profile_sheet_key(
+            sheet_name,
+            entity_type,
+            usable_sheet_names,
+            workbook_sheets,
+            task_columns,
+        )
+        pipeline_status_columns_profile_key = find_profile_sheet_key(
+            sheet_name,
+            entity_type,
+            usable_sheet_names,
+            workbook_sheets,
+            pipeline_status_columns,
+        )
+
         st.session_state[f"pipeline_step_{sheet_name}"] = clean_text(
             pipeline_steps.get(
-                sheet_name,
+                pipeline_step_profile_key,
                 DEFAULT_PIPELINE_STEP_BY_ENTITY.get(entity_type, ""),
             )
         )
-        st.session_state[f"task_columns_{sheet_name}"] = list(task_columns.get(sheet_name, []))
+        st.session_state[f"task_columns_{sheet_name}"] = list(
+            task_columns.get(task_columns_profile_key, [])
+        )
+        st.session_state[f"pipeline_status_columns_{sheet_name}"] = list(
+            pipeline_status_columns.get(pipeline_status_columns_profile_key, [])
+        )
+
 
 
 def parse_uploaded_profile(uploaded_profile_file) -> Dict[str, object] | None:
@@ -140,6 +204,79 @@ def parse_uploaded_profile(uploaded_profile_file) -> Dict[str, object] | None:
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     return raw if isinstance(raw, dict) else None
+
+
+# Sidebar header/profile import UI
+
+# Helper for mapping profile sheet keys to current sheet names
+def find_profile_sheet_key(
+    sheet_name: str,
+    entity_type: str,
+    usable_sheet_names: List[str],
+    workbook_sheets: Dict[str, pd.DataFrame],
+    profile_mapping: Dict[str, object],
+) -> str | None:
+    if sheet_name in profile_mapping:
+        return sheet_name
+
+    normalized_sheet_name = normalize_sheet_name(sheet_name)
+    for profile_sheet_name in profile_mapping.keys():
+        if normalize_sheet_name(profile_sheet_name) == normalized_sheet_name:
+            return profile_sheet_name
+
+    if len(profile_mapping) == 1 and len(usable_sheet_names) == 1:
+        return next(iter(profile_mapping.keys()))
+
+    matching_profile_sheet_names = []
+    for profile_sheet_name in profile_mapping.keys():
+        if profile_sheet_name in workbook_sheets:
+            profile_entity_type, _ = detect_entity_info(workbook_sheets[profile_sheet_name], profile_sheet_name)
+        else:
+            profile_entity_type = "Asset" if "asset" in normalize_sheet_name(profile_sheet_name) else "Shot"
+        if profile_entity_type == entity_type:
+            matching_profile_sheet_names.append(profile_sheet_name)
+
+    matching_current_sheet_names = []
+    for current_sheet_name in usable_sheet_names:
+        current_entity_type, _ = detect_entity_info(workbook_sheets[current_sheet_name], current_sheet_name)
+        if current_entity_type == entity_type:
+            matching_current_sheet_names.append(current_sheet_name)
+
+    if len(matching_profile_sheet_names) == 1 and len(matching_current_sheet_names) == 1:
+        return matching_profile_sheet_names[0]
+
+    return None
+
+
+def render_profile_sidebar_header() -> str:
+    st.sidebar.header("Profiles")
+    profile_name_value = st.sidebar.text_input("Profile name", value="WSR Profile")
+
+    uploaded_profile_file = st.sidebar.file_uploader(
+        "Import profile",
+        type=["json"],
+        accept_multiple_files=False,
+        key="uploaded_profile_file",
+        help="Upload a previously exported profile JSON to restore selected sheets, task columns, pipeline steps, and optional output columns.",
+    )
+
+    imported_profile = parse_uploaded_profile(uploaded_profile_file)
+    if uploaded_profile_file is not None and imported_profile is None:
+        st.sidebar.error("Could not read that profile JSON.")
+    elif imported_profile is not None:
+        profile_signature = f"{uploaded_profile_file.name}:{len(uploaded_profile_file.getvalue())}"
+        if st.session_state.get("loaded_profile_signature") != profile_signature:
+            st.session_state["imported_profile_state"] = imported_profile
+            st.session_state["loaded_profile_signature"] = profile_signature
+            st.session_state["profile_needs_apply"] = True
+        st.sidebar.success("Profile loaded. It will automatically apply when a new WSR is uploaded.")
+
+    if "imported_profile_state" in st.session_state:
+        if st.sidebar.button("Re-apply imported profile", use_container_width=True):
+            st.session_state["profile_needs_apply"] = True
+            st.rerun()
+
+    return profile_name_value
 
 
 def normalize_sheet_name(name: str) -> str:
@@ -164,11 +301,48 @@ def to_timestamp(value):
     return parsed
 
 
+
 def format_date(value) -> str:
     parsed = to_timestamp(value)
     if pd.isna(parsed):
         return ""
     return parsed.strftime("%Y-%m-%d")
+
+
+# New: Extract a robust WSR report timestamp from a row
+def get_wsr_report_timestamp(row) -> pd.Timestamp:
+    date_candidates = [
+        row.get("Date", ""),
+        row.get("Report Date", ""),
+        row.get("WSR Report Date", ""),
+    ]
+    for date_candidate in date_candidates:
+        parsed = to_timestamp(date_candidate)
+        if pd.notna(parsed):
+            return parsed
+
+    report_name = get_wsr_report_name(row)
+    match = re.search(r"(20\d{6})", report_name)
+    if match:
+        parsed = pd.to_datetime(match.group(1), format="%Y%m%d", errors="coerce")
+        if pd.notna(parsed):
+            return parsed
+
+    return pd.NaT
+
+# New: Extract WSR report name from row (robust)
+def get_wsr_report_name(row) -> str:
+    for key in ["WSR", "WSR Report Name", "Report Name"]:
+        value = clean_text(row.get(key, ""))
+        if value:
+            return value
+    return ""
+
+
+def format_timestamp(value) -> str:
+    if pd.isna(value):
+        return ""
+    return value.strftime("%Y-%m-%d")
 
 
 def detect_entity_info(df: pd.DataFrame, fallback_sheet_name: str) -> Tuple[str, str]:
@@ -218,7 +392,14 @@ def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_workbook(file_bytes: bytes) -> Dict[str, pd.DataFrame]:
+def load_workbook(file_bytes: bytes, file_name: str) -> Dict[str, pd.DataFrame]:
+    file_extension = file_name.lower().rsplit(".", 1)[-1] if "." in file_name else ""
+
+    if file_extension == "csv":
+        csv_df = pd.read_csv(io.BytesIO(file_bytes))
+        sheet_name = file_name.rsplit(".", 1)[0] or "CSV"
+        return {sheet_name: csv_df}
+
     workbook = pd.ExcelFile(io.BytesIO(file_bytes))
     sheets = {}
     for sheet_name in workbook.sheet_names:
@@ -229,12 +410,13 @@ def load_workbook(file_bytes: bytes) -> Dict[str, pd.DataFrame]:
 @st.cache_data(show_spinner=False)
 def build_task_rows(
     file_bytes: bytes,
+    file_name: str,
     included_sheets: List[str],
     selected_task_columns_by_sheet: Dict[str, List[str]],
     pipeline_step_by_sheet: Dict[str, str],
     include_blank_dates: bool,
 ) -> pd.DataFrame:
-    workbook_sheets = load_workbook(file_bytes)
+    workbook_sheets = load_workbook(file_bytes, file_name)
     rows = []
 
     for sheet_name in included_sheets:
@@ -266,9 +448,9 @@ def build_task_rows(
             if not entity_code:
                 continue
 
-            report_name = clean_text(row.get("Report Name", ""))
+            report_name = get_wsr_report_name(row)
             vendor = clean_text(row.get("Vendor", ""))
-            report_date = format_date(row.get("Date", ""))
+            report_date = format_timestamp(get_wsr_report_timestamp(row))
             vendor_status = clean_text(row.get("Vendor Status", ""))
             turnover_status = clean_text(row.get("Turnover Status", ""))
             turnover_code = clean_text(row.get("Turnover Code", ""))
@@ -349,17 +531,134 @@ def build_task_rows(
     return result
 
 
-st.title("WSR Task Builder")
-st.write("Upload a vendor WSR and convert each pipeline date on each WSR item into an individual Task row for ShotGrid import.")
+# New function for pipeline status rows
+@st.cache_data(show_spinner=False)
+def build_pipeline_status_rows(
+    file_bytes: bytes,
+    file_name: str,
+    included_sheets: List[str],
+    selected_pipeline_status_columns_by_sheet: Dict[str, List[str]],
+) -> pd.DataFrame:
+    workbook_sheets = load_workbook(file_bytes, file_name)
+    rows = []
 
-uploaded_file = st.file_uploader("Upload WSR workbook", type=["xlsx", "xlsm", "xls"])
+    for sheet_name in included_sheets:
+        df = workbook_sheets[sheet_name].copy()
+        entity_type, entity_column = detect_entity_info(df, sheet_name)
+        if entity_type != "Shot" or entity_column not in df.columns:
+            continue
+
+        selected_status_columns = selected_pipeline_status_columns_by_sheet.get(sheet_name, [])
+        selected_status_column_names = {str(col).strip() for col in selected_status_columns}
+        status_columns = [
+            col for col in df.columns
+            if str(col).strip() in selected_status_column_names
+        ]
+
+        if not status_columns:
+            continue
+
+        for row_index, row in df.iterrows():
+            entity_code = clean_text(row.get(entity_column, ""))
+            if not entity_code:
+                continue
+
+            report_name = get_wsr_report_name(row)
+            vendor = clean_text(row.get("Vendor", ""))
+            report_date = get_wsr_report_timestamp(row)
+            report_date_text = format_timestamp(report_date)
+
+            dated_steps = []
+            for status_column in status_columns:
+                step_date = to_timestamp(row.get(status_column, ""))
+                if pd.isna(step_date):
+                    continue
+                dated_steps.append((step_date, str(status_column).strip()))
+
+
+            current_pipeline_step = ""
+            current_pipeline_step_date = ""
+            previous_pipeline_step = ""
+            previous_pipeline_step_date = ""
+            next_pipeline_step = ""
+            next_pipeline_step_date = ""
+
+            if dated_steps:
+                if pd.isna(report_date):
+                    current_index = 0
+                else:
+                    current_index = None
+                    for index, (step_date, step_name) in enumerate(dated_steps):
+                        if report_date <= step_date:
+                            current_index = index
+                            break
+
+                    if current_index is None:
+                        current_pipeline_step = "Complete"
+                        previous_pipeline_step = dated_steps[-1][1]
+                        previous_pipeline_step_date = dated_steps[-1][0].strftime("%Y-%m-%d")
+
+                if current_pipeline_step != "Complete":
+                    current_step_date, current_step_name = dated_steps[current_index]
+                    current_pipeline_step = current_step_name
+                    current_pipeline_step_date = current_step_date.strftime("%Y-%m-%d")
+
+                    if current_index > 0:
+                        previous_step_date, previous_step_name = dated_steps[current_index - 1]
+                        previous_pipeline_step = previous_step_name
+                        previous_pipeline_step_date = previous_step_date.strftime("%Y-%m-%d")
+
+                    if current_index + 1 < len(dated_steps):
+                        next_step_date, next_step_name = dated_steps[current_index + 1]
+                        next_pipeline_step = next_step_name
+                        next_pipeline_step_date = next_step_date.strftime("%Y-%m-%d")
+
+            rows.append(
+                {
+                    "Link": entity_code,
+                    "Current Pipeline Step": current_pipeline_step,
+                    "Current Pipeline Step Date": current_pipeline_step_date,
+                    "Previous Pipeline Step": previous_pipeline_step,
+                    "Previous Pipeline Step Date": previous_pipeline_step_date,
+                    "Next Pipeline Step": next_pipeline_step,
+                    "Next Pipeline Step Date": next_pipeline_step_date,
+                    "WSR Report Name": report_name,
+                    "WSR Report Date": report_date_text,
+                    "Vendor": vendor,
+                    "Source Sheet": sheet_name,
+                    "Source Row": row_index + 2
+                }
+            )
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+
+    result = result.sort_values(by=["Link", "WSR Report Date"]).reset_index(drop=True)
+    return result
+
+
+st.title("WSR Task Builder")
+st.write("Upload a vendor WSR workbook or CSV and convert each pipeline date on each WSR item into an individual Task row for ShotGrid import.")
+profile_name = render_profile_sidebar_header()
+
+uploaded_file = st.file_uploader("Upload WSR workbook or CSV", type=["xlsx", "xlsm", "xls", "csv"])
 
 if uploaded_file is None:
-    st.info("Upload a WSR workbook to begin.")
+    st.info("Upload a WSR workbook or CSV to begin.")
     st.stop()
 
 file_bytes = uploaded_file.getvalue()
-workbook_sheets = load_workbook(file_bytes)
+file_name = uploaded_file.name
+workbook_sheets = load_workbook(file_bytes, file_name)
+
+# Use a file signature to track changes and trigger profile apply as needed
+file_signature = f"{file_name}:{len(file_bytes)}"
+if st.session_state.get("last_loaded_file_signature") != file_signature:
+    st.session_state["last_loaded_file_signature"] = file_signature
+    if "imported_profile_state" in st.session_state:
+        st.session_state["profile_needs_apply"] = True
+
 all_sheet_names = list(workbook_sheets.keys())
 usable_sheet_names = [
     sheet_name
@@ -387,25 +686,14 @@ else:
 if "selected_optional_columns" not in st.session_state:
     st.session_state["selected_optional_columns"] = []
 
+
+# Handle imported profile state: apply if needed after file load
+if st.session_state.get("profile_needs_apply"):
+    if "imported_profile_state" in st.session_state:
+        apply_profile_state(st.session_state["imported_profile_state"], usable_sheet_names, workbook_sheets)
+    st.session_state["profile_needs_apply"] = False
+
 with st.sidebar:
-    st.header("Profiles")
-    profile_name = st.text_input("Profile name", value="WSR Profile")
-
-    uploaded_profile_file = st.file_uploader(
-        "Import profile",
-        type=["json"],
-        accept_multiple_files=False,
-        key="uploaded_profile_file",
-        help="Upload a previously exported profile JSON to restore selected sheets, task columns, pipeline steps, and optional output columns.",
-    )
-
-    imported_profile = parse_uploaded_profile(uploaded_profile_file)
-    if uploaded_profile_file is not None and imported_profile is None:
-        st.error("Could not read that profile JSON.")
-    elif uploaded_profile_file is not None and st.button("Apply imported profile", use_container_width=True):
-        apply_profile_state(imported_profile, usable_sheet_names, workbook_sheets)
-        st.rerun()
-
     st.header("Output Options")
     include_blank_dates = st.checkbox(
         "Include tasks even when the pipeline date is blank",
@@ -426,6 +714,7 @@ if not included_sheets:
     st.stop()
 
 selected_task_columns_by_sheet: Dict[str, List[str]] = {}
+selected_pipeline_status_columns_by_sheet: Dict[str, List[str]] = {}
 pipeline_step_by_sheet: Dict[str, str] = {}
 
 st.subheader("Pipeline date columns")
@@ -475,8 +764,12 @@ for sheet_name in included_sheets:
             if is_mostly_dates(df[col]):
                 detected_date_columns.append(col)
 
-        available_task_columns = preferred_columns_in_sheet + [
-            col for col in detected_date_columns if col not in preferred_columns_in_sheet
+        available_task_column_names = {
+            str(col).strip() for col in [*preferred_columns_in_sheet, *detected_date_columns]
+        }
+        available_task_columns = [
+            col for col in df.columns
+            if str(col).strip() in available_task_column_names
         ]
         default_columns = [col for col in available_task_columns if str(col).strip() in default_pipeline_columns]
         task_columns_key = f"task_columns_{sheet_name}"
@@ -487,11 +780,50 @@ for sheet_name in included_sheets:
         selected_columns = st.multiselect(
             f"Task columns for {sheet_name}",
             options=available_task_columns,
-            default=st.session_state.get(task_columns_key, default_columns),
+            default=sanitized_task_columns,
             key=task_columns_key,
             help="Choose which detected date columns should generate tasks for this sheet. Default pipeline columns are preselected, and any other column containing at least one parseable date will also appear as an option.",
         )
         selected_task_columns_by_sheet[sheet_name] = selected_columns
+
+        # Pipeline status columns selection for Shot sheets
+        if entity_type == "Shot":
+            default_pipeline_status_columns = [
+                col for col in available_task_columns
+                if str(col).strip() in {
+                    "Layout",
+                    "Anim Primary",
+                    "Anim Final",
+                    "WIP Comp",
+                    "Comp Creative Final",
+                    "Creative Approval",
+                    "Tech Final",
+                }
+            ]
+            pipeline_status_columns_key = f"pipeline_status_columns_{sheet_name}"
+            saved_pipeline_status_columns = st.session_state.get(
+                pipeline_status_columns_key,
+                default_pipeline_status_columns,
+            )
+            sanitized_pipeline_status_columns = [
+                col for col in saved_pipeline_status_columns if col in available_task_columns
+            ]
+            if (
+                pipeline_status_columns_key not in st.session_state
+                or saved_pipeline_status_columns != sanitized_pipeline_status_columns
+            ):
+                st.session_state[pipeline_status_columns_key] = sanitized_pipeline_status_columns
+            selected_pipeline_status_columns = st.multiselect(
+                f"Pipeline status columns for {sheet_name}",
+                options=available_task_columns,
+                default=sanitized_pipeline_status_columns,
+                key=pipeline_status_columns_key,
+                help="Choose the shot pipeline date columns used to determine the current pipeline status. The export always applies these in the workbook header order from left to right, regardless of selection order. Blank dates are ignored per shot.",
+            )
+        else:
+            selected_pipeline_status_columns = []
+
+        selected_pipeline_status_columns_by_sheet[sheet_name] = selected_pipeline_status_columns
 
         preview_df = dataframe_for_display(df)
         selected_column_names = {str(col).strip() for col in selected_columns}
@@ -510,6 +842,7 @@ if not any(selected_task_columns_by_sheet.values()):
 
 tasks_df = build_task_rows(
     file_bytes=file_bytes,
+    file_name=file_name,
     included_sheets=included_sheets,
     selected_task_columns_by_sheet=selected_task_columns_by_sheet,
     pipeline_step_by_sheet=pipeline_step_by_sheet,
@@ -544,7 +877,6 @@ required_columns = [
 
 base_optional_columns = [
     "Description",
-    "Entity Type",
 ]
 
 workbook_optional_columns = []
@@ -611,6 +943,7 @@ col3.metric("Unique task names", tasks_df["Task Name"].nunique())
 
 st.dataframe(dataframe_for_display(output_df), width="stretch", height=520)
 
+
 csv_bytes = output_df.to_csv(index=False).encode("utf-8")
 st.download_button(
     label="Download task CSV",
@@ -618,4 +951,27 @@ st.download_button(
     file_name="wsr_tasks_for_shotgrid.csv",
     mime="text/csv",
 )
+
+
+# Pipeline status export block
+pipeline_status_df = build_pipeline_status_rows(
+    file_bytes=file_bytes,
+    file_name=file_name,
+    included_sheets=included_sheets,
+    selected_pipeline_status_columns_by_sheet=selected_pipeline_status_columns_by_sheet,
+)
+
+st.subheader("Pipeline status export")
+if pipeline_status_df.empty:
+    st.info("No shot pipeline status rows were generated. Make sure a Shots sheet is selected and at least one pipeline status column is selected.")
+else:
+    st.write("This table uses only the columns selected in the Pipeline status columns dropdown to determine which pipeline step each shot is currently in. The selected steps follow the workbook header order from left to right. Blank dates are ignored per shot. Assets are ignored.")
+    st.dataframe(dataframe_for_display(pipeline_status_df), width="stretch", height=420)
+    pipeline_status_csv_bytes = pipeline_status_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download pipeline status CSV",
+        data=pipeline_status_csv_bytes,
+        file_name="wsr_pipeline_status.csv",
+        mime="text/csv",
+    )
 
